@@ -1,0 +1,324 @@
+"""
+Data Leakage Validation Script for ArkTS-CodeSearch
+
+Validates data leakage between train/validation/test splits across two datasets:
+1. Original (random split): hreyulog/arkts-code-docstring
+2. Resplit-by-repo:          hreyulog/arkts-code-docstring-resplit-by-repo
+
+Analyses:
+  Step 2: Exact duplicate detection (by function_sha and by (docstring, function) pair)
+  Step 3: Near-duplicate detection (MinHash/LSH at thresholds 0.5/0.7/0.8/0.9)
+  Step 4: Repository-level contamination (nwo overlap across splits)
+  Step 5: Docstring/query overlap (exact and fuzzy)
+"""
+
+import json
+import hashlib
+import re
+import sys
+from collections import defaultdict
+from typing import Dict, List, Set, Tuple
+
+from datasets import load_dataset
+from datasketch import MinHash, MinHashLSH
+
+
+def tokenize_code(code: str) -> List[str]:
+    return re.findall(r'[a-zA-Z0-9_]+', code)
+
+
+def shingle(tokens: List[str], k: int = 3) -> Set[str]:
+    if len(tokens) < k:
+        return {"".join(tokens)} if tokens else set()
+    return {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
+
+
+def make_minhash(text: str, num_perm: int = 128) -> MinHash:
+    tokens = tokenize_code(text)
+    shingles = shingle(tokens, k=3)
+    mh = MinHash(num_perm=num_perm)
+    for s in shingles:
+        mh.update(s.encode("utf-8"))
+    return mh
+
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def jaccard_set(a: Set, b: Set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def load_all_splits(dataset_name: str) -> Dict[str, List[dict]]:
+    print(f"\n>>> Loading dataset: {dataset_name}")
+    ds = load_dataset(dataset_name)
+    splits = {}
+    for split_name in ("train", "validation", "test"):
+        if split_name in ds:
+            splits[split_name] = list(ds[split_name])
+            print(f"    {split_name}: {len(splits[split_name])} samples")
+    return splits
+
+
+def step2_exact_duplicates(splits: Dict[str, List[dict]], label: str):
+    print(f"\n{'='*70}")
+    print(f"Step 2: Exact Duplicate Detection - {label}")
+    print(f"{'='*70}")
+
+    sha_sets: Dict[str, Set[str]] = {}
+    pair_sets: Dict[str, Set[str]] = {}
+
+    for split_name, records in splits.items():
+        sha_set = set()
+        pair_set = set()
+        for r in records:
+            fs = r.get("function_sha") or ""
+            sha_set.add(fs)
+            pair_key = hashlib.md5(
+                (normalize(r.get("docstring", "")) + "|||" + normalize(r.get("function", ""))).encode()
+            ).hexdigest()
+            pair_set.add(pair_key)
+        sha_sets[split_name] = sha_set
+        pair_sets[split_name] = pair_set
+
+    split_names = list(splits.keys())
+    for i in range(len(split_names)):
+        for j in range(i + 1, len(split_names)):
+            s1, s2 = split_names[i], split_names[j]
+            sha_overlap = sha_sets[s1] & sha_sets[s2]
+            pair_overlap = pair_sets[s1] & pair_sets[s2]
+            print(f"  {s1} <-> {s2}:")
+            print(f"    function_sha overlap:  {len(sha_overlap)}")
+            print(f"    (docstring,function) overlap: {len(pair_overlap)}")
+
+    sha_to_splits: Dict[str, Set[str]] = defaultdict(set)
+    for split_name, records in splits.items():
+        for r in records:
+            fs = r.get("function_sha") or ""
+            sha_to_splits[fs].add(split_name)
+
+    cross_dup_sha = sum(1 for ss in sha_to_splits.values() if len(ss) > 1)
+    print(f"  function_sha values appearing in >1 split: {cross_dup_sha}")
+
+
+def step3_near_duplicates(splits: Dict[str, List[dict]], label: str, thresholds=(0.5, 0.7, 0.8, 0.9)):
+    print(f"\n{'='*70}")
+    print(f"Step 3: Near-Duplicate Detection (MinHash/LSH) - {label}")
+    print(f"{'='*70}")
+
+    train_records = splits.get("train", [])
+    test_records = splits.get("test", [])
+
+    if not train_records or not test_records:
+        print("  Skipping: train or test split missing.")
+        return
+
+    num_perm = 128
+    print(f"  Computing MinHash for {len(train_records)} train + {len(test_records)} test samples ...")
+
+    train_mhs: List[Tuple[int, MinHash]] = []
+    for idx, r in enumerate(train_records):
+        mh = make_minhash(r.get("function", ""), num_perm=num_perm)
+        train_mhs.append((idx, mh))
+
+    test_mhs: List[Tuple[int, MinHash]] = []
+    for idx, r in enumerate(test_records):
+        mh = make_minhash(r.get("function", ""), num_perm=num_perm)
+        test_mhs.append((idx, mh))
+
+    for threshold in thresholds:
+        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+
+        for idx, mh in train_mhs:
+            lsh.insert(f"train_{idx}", mh)
+
+        near_dup_count = 0
+        near_dup_pairs: List[Tuple[int, int, float]] = []
+
+        for test_idx, test_mh in test_mhs:
+            results = lsh.query(test_mh)
+            if results:
+                for r in results:
+                    train_idx = int(r.split("_")[1])
+                    sim = test_mh.jaccard(train_mhs[train_idx][1])
+                    if sim >= threshold:
+                        near_dup_pairs.append((test_idx, train_idx, sim))
+                near_dup_count += 1
+
+        pct = near_dup_count / len(test_records) * 100
+        print(f"  Threshold {threshold:.1f}: {near_dup_count} test samples have near-dup in train ({pct:.2f}%), {len(near_dup_pairs)} total pairs")
+
+        if near_dup_pairs and len(near_dup_pairs) <= 20:
+            for ti, tri, sim in sorted(near_dup_pairs, key=lambda x: -x[2])[:10]:
+                print(f"    test[{ti}] <-> train[{tri}]  Jaccard={sim:.4f}")
+
+
+def step4_repo_contamination(splits: Dict[str, List[dict]], label: str):
+    print(f"\n{'='*70}")
+    print(f"Step 4: Repository-Level Contamination - {label}")
+    print(f"{'='*70}")
+
+    repo_sets: Dict[str, Set[str]] = {}
+    repo_sample_count: Dict[str, Dict[str, int]] = {}
+
+    for split_name, records in splits.items():
+        repos: Set[str] = set()
+        repo_counts: Dict[str, int] = defaultdict(int)
+        for r in records:
+            nwo = r.get("nwo", "")
+            if nwo:
+                repos.add(nwo)
+                repo_counts[nwo] += 1
+        repo_sets[split_name] = repos
+        repo_sample_count[split_name] = dict(repo_counts)
+        print(f"  {split_name}: {len(repos)} distinct repos, {len(records)} samples")
+
+    split_names = list(splits.keys())
+    for i in range(len(split_names)):
+        for j in range(i + 1, len(split_names)):
+            s1, s2 = split_names[i], split_names[j]
+            overlap_repos = repo_sets[s1] & repo_sets[s2]
+
+            contaminated_s2 = 0
+            for repo in overlap_repos:
+                contaminated_s2 += repo_sample_count[s2].get(repo, 0)
+
+            pct_repos = len(overlap_repos) / len(repo_sets[s2]) * 100 if repo_sets[s2] else 0
+            pct_samples = contaminated_s2 / len(splits[s2]) * 100 if splits[s2] else 0
+
+            print(f"\n  {s1} <-> {s2}:")
+            print(f"    Overlapping repos: {len(overlap_repos)} / {len(repo_sets[s2])} {s2} repos ({pct_repos:.2f}%)")
+            print(f"    {s2} samples from overlapping repos: {contaminated_s2} / {len(splits[s2])} ({pct_samples:.2f}%)")
+
+            if overlap_repos:
+                top_repos = sorted(
+                    overlap_repos,
+                    key=lambda r: repo_sample_count[s1].get(r, 0) + repo_sample_count[s2].get(r, 0),
+                    reverse=True,
+                )[:10]
+                print(f"    Top overlapping repos:")
+                for repo in top_repos:
+                    c1 = repo_sample_count[s1].get(repo, 0)
+                    c2 = repo_sample_count[s2].get(repo, 0)
+                    print(f"      {repo}: {s1}={c1}, {s2}={c2}")
+
+
+def step5_docstring_overlap(splits: Dict[str, List[dict]], label: str):
+    print(f"\n{'='*70}")
+    print(f"Step 5: Docstring/Query Overlap - {label}")
+    print(f"{'='*70}")
+
+    train_records = splits.get("train", [])
+    test_records = splits.get("test", [])
+
+    if not train_records or not test_records:
+        print("  Skipping: train or test split missing.")
+        return
+
+    train_docstrings = set()
+    for r in train_records:
+        d = normalize(r.get("docstring", ""))
+        if d:
+            train_docstrings.add(d)
+
+    test_docstrings: List[str] = []
+    for r in test_records:
+        d = normalize(r.get("docstring", ""))
+        if d:
+            test_docstrings.append(d)
+
+    exact_overlap = 0
+    for d in test_docstrings:
+        if d in train_docstrings:
+            exact_overlap += 1
+
+    pct = exact_overlap / len(test_docstrings) * 100 if test_docstrings else 0
+    print(f"  Exact docstring overlap (train<->test): {exact_overlap} / {len(test_docstrings)} ({pct:.2f}%)")
+
+    train_doc_tokens: Dict[str, Set[str]] = {}
+    for d in train_docstrings:
+        train_doc_tokens[d] = set(tokenize_code(d))
+
+    fuzzy_count_07 = 0
+    fuzzy_count_09 = 0
+    fuzzy_pairs: List[Tuple[str, str, float]] = []
+
+    test_doc_unique = list(set(test_docstrings))
+    print(f"  Unique test docstrings: {len(test_doc_unique)}")
+    print(f"  Unique train docstrings: {len(train_docstrings)}")
+    print(f"  Computing fuzzy overlap (this may take a while) ...")
+
+    for idx, td in enumerate(test_doc_unique):
+        if idx % 500 == 0 and idx > 0:
+            print(f"    ... processed {idx}/{len(test_doc_unique)}")
+        td_tokens = set(tokenize_code(td))
+        if not td_tokens:
+            continue
+        best_sim = 0.0
+        best_match = ""
+        for train_d, train_tk in train_doc_tokens.items():
+            if not train_tk:
+                continue
+            sim = jaccard_set(td_tokens, train_tk)
+            if sim > best_sim:
+                best_sim = sim
+                best_match = train_d
+        if best_sim >= 0.7:
+            fuzzy_count_07 += 1
+        if best_sim >= 0.9:
+            fuzzy_count_09 += 1
+        if best_sim >= 0.7:
+            fuzzy_pairs.append((td[:80], best_match[:80], best_sim))
+
+    pct_07 = fuzzy_count_07 / len(test_doc_unique) * 100 if test_doc_unique else 0
+    pct_09 = fuzzy_count_09 / len(test_doc_unique) * 100 if test_doc_unique else 0
+    print(f"  Fuzzy docstring overlap (Jaccard>=0.7): {fuzzy_count_07} / {len(test_doc_unique)} unique test docstrings ({pct_07:.2f}%)")
+    print(f"  Fuzzy docstring overlap (Jaccard>=0.9): {fuzzy_count_09} / {len(test_doc_unique)} unique test docstrings ({pct_09:.2f}%)")
+
+    if fuzzy_pairs:
+        print(f"  Top fuzzy matches:")
+        for td, tr, sim in sorted(fuzzy_pairs, key=lambda x: -x[2])[:5]:
+            print(f"    Jaccard={sim:.4f}")
+            try:
+                print(f"      test:  {td}...")
+                print(f"      train: {tr}...")
+            except UnicodeEncodeError:
+                print(f"      test:  [non-ASCII docstring]")
+                print(f"      train: [non-ASCII docstring]")
+
+
+def main():
+    datasets = [
+        ("hreyulog/arkts-code-docstring", "Original (Random Split)"),
+        ("hreyulog/arkts-code-docstring-resplit-by-repo", "Resplit-by-Repo"),
+    ]
+
+    for ds_name, ds_label in datasets:
+        print(f"\n\n{'#'*70}")
+        print(f"# Dataset: {ds_label}")
+        print(f"# HF path: {ds_name}")
+        print(f"{'#'*70}")
+
+        try:
+            splits = load_all_splits(ds_name)
+        except Exception as e:
+            print(f"  ERROR loading dataset: {e}")
+            continue
+
+        step2_exact_duplicates(splits, ds_label)
+        step4_repo_contamination(splits, ds_label)
+        step5_docstring_overlap(splits, ds_label)
+        step3_near_duplicates(splits, ds_label)
+
+    print(f"\n\n{'#'*70}")
+    print("# Validation complete.")
+    print(f"{'#'*70}")
+
+
+if __name__ == "__main__":
+    main()
